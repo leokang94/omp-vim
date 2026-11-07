@@ -109,7 +109,9 @@ export function normalizeDelimiterKey(key: string): DelimiterSpec | null {
         ? "[]"
         : key === "{" || key === "}" || key === "B"
           ? "{}"
-          : null;
+          : key === "<" || key === ">"
+            ? "<>"
+            : null;
   return pair ? { type: "bracket", open: pair[0], close: pair[1] } : null;
 }
 
@@ -276,6 +278,34 @@ export function resolveDelimitedTextObjectRange(
   }
 
   return null;
+}
+
+const NEAREST_DELIMITER_KEYS = ["(", "[", "{", "<", '"', "'", "`"] as const;
+
+/**
+ * Resolves the innermost delimiter pair of any supported kind around the
+ * cursor (vim-sandwich's `ib`/`ab`, `sdb`, `srb`). The pair whose outer range
+ * is narrowest wins, so nested `("x")` picks the quotes from inside `x`.
+ */
+export function resolveNearestDelimitedPair(
+  text: string,
+  cursorAbs: number,
+): { outer: TextObjectRange; inner: TextObjectRange } | null {
+  let best: { outer: TextObjectRange; inner: TextObjectRange } | null = null;
+  for (const key of NEAREST_DELIMITER_KEYS) {
+    const outer = resolveDelimitedTextObjectRange(text, cursorAbs, "a", key);
+    if (!outer) continue;
+    if (
+      best !== null &&
+      outer.endAbs - outer.startAbs >= best.outer.endAbs - best.outer.startAbs
+    )
+      continue;
+    best = {
+      outer,
+      inner: { startAbs: outer.startAbs + 1, endAbs: outer.endAbs - 1 },
+    };
+  }
+  return best;
 }
 
 export function resolveWordTextObjectRange(

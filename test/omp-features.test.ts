@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { getEditorTheme } from "@oh-my-pi/pi-coding-agent";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { ModalEditor } from "../index.ts";
+import { readPiVimSurroundKeymap } from "../settings.ts";
 
 const ESC = "\x1b";
 
@@ -507,4 +508,123 @@ test("second reflow during hard-split typing keeps adjacency (X then Y)", () => 
   for (const l of ed.getLines()) {
     assert.ok(visibleWidth(l) <= 54, JSON.stringify(ed.getLines()));
   }
+});
+
+// --- vim-sandwich keymap (default surroundKeymap) ---------------------------
+
+function runNormal(
+  text: string,
+  cmd: string,
+  keymap?: "surround" | "sandwich",
+) {
+  const { ed, keys } = makeEditor();
+  if (keymap) ed.setSurroundKeymap(keymap);
+  ed.setText(text);
+  keys(ESC);
+  keys(cmd);
+  return ed;
+}
+
+test("sandwich sa{motion}{char} wraps without padding", () => {
+  assert.equal(runNormal("hello world", "0saiw'").getText(), "'hello' world");
+  // Both brackets of a pair add no inner space (sandwich default recipes).
+  assert.equal(runNormal("foo bar", "0saiw(").getText(), "(foo) bar");
+  assert.equal(runNormal("foo bar", "0saiw)").getText(), "(foo) bar");
+  assert.equal(runNormal("foo bar", "0wsa$]").getText(), "foo [bar]");
+  assert.equal(runNormal("foo bar", '0saw"').getText(), '"foo "bar');
+  assert.equal(runNormal("foo bar", "0sae{").getText(), "{foo} bar");
+  assert.equal(runNormal("a_b c", "0saf_'").getText(), "'a_'b c");
+  assert.equal(runNormal("a_b c", "0sat_'").getText(), "'a'_b c");
+  assert.equal(runNormal("foo bar", "$sab`").getText(), "foo `ba`r");
+});
+
+test("sandwich sa composes with ib and is{char} text objects", () => {
+  assert.equal(runNormal("(abc)", '0lsaib"').getText(), '("abc")');
+  assert.equal(runNormal("x 'abc' y", "0fbsais'(").getText(), "x '(abc)' y");
+  assert.equal(runNormal("x 'abc' y", "0fbsaas'[").getText(), "x ['abc'] y");
+});
+
+test("sandwich visual sa / sd / sr", () => {
+  assert.equal(runNormal("hello world", "0viwsa'").getText(), "'hello' world");
+  assert.equal(runNormal("x(abc)y", "0lv4lsd").getText(), "xabcy");
+  assert.equal(runNormal("x(abc)y", "0lv4lsr[").getText(), "x[abc]y");
+  assert.equal(runNormal("x'abc'y", '0lv4lsr"').getText(), 'x"abc"y');
+  // Ends that are not a matching pair are left alone.
+  assert.equal(runNormal("x(abc]y", "0lv4lsd").getText(), "x(abc]y");
+});
+
+test("sandwich sd{char} / sdb and sr{old}{new} / srb{new}", () => {
+  assert.equal(runNormal("say 'hi' now", "0fhsd'").getText(), "say hi now");
+  assert.equal(runNormal("a <b> c", "0fbsd<").getText(), "a b c");
+  // sdb picks the innermost pair of any kind around the cursor.
+  assert.equal(runNormal('f(["x"])', "0fxsdb").getText(), "f([x])");
+  assert.equal(runNormal("'hi'", "0lsr'\"").getText(), '"hi"');
+  assert.equal(runNormal("'hi'", "0lsr'(").getText(), "(hi)");
+  assert.equal(runNormal("(a [b] c)", "0fbsrb{").getText(), "(a {b} c)");
+  assert.equal(runNormal("(a [b] c)", "0fasrb'").getText(), "'a [b] c'");
+});
+
+test("sandwich ib/ab auto-detect and is/as{char} text objects", () => {
+  assert.equal(runNormal('f(a, "b")', "0fadib").getText(), "f()");
+  assert.equal(runNormal('f(a, "b")', "0fbdib").getText(), 'f(a, "")');
+  assert.equal(runNormal('f(a, "b")', "0fbvabd").getText(), "f(a, )");
+  assert.equal(runNormal("x 'abc' y", "0fbdis'").getText(), "x '' y");
+  assert.equal(runNormal("a (b) c", "0fbvas(d").getText(), "a  c");
+  // Operator-pending is/as with no matching pair is a no-op.
+  assert.equal(runNormal("a b c", "0fbdis'").getText(), "a b c");
+});
+
+test("sandwich s prefix is a no-op before unrelated keys; sa is undoable", () => {
+  const moved = runNormal("abc", "0sl");
+  assert.equal(moved.getText(), "abc");
+  assert.deepEqual(moved.getCursor(), { line: 0, col: 1 });
+  assert.equal(runNormal("abc", "0sx").getText(), "bc");
+
+  const { ed, keys } = makeEditor();
+  ed.setText("hello");
+  keys(`${ESC}0saiw'`);
+  assert.equal(ed.getText(), "'hello'");
+  keys("u");
+  assert.equal(ed.getText(), "hello");
+});
+
+test("vim-surround commands keep working alongside sandwich", () => {
+  assert.equal(runNormal("hello", "0ysiw(").getText(), "( hello )");
+  assert.equal(runNormal("hello", "0ysiw)").getText(), "(hello)");
+  assert.equal(runNormal("foo bar", "0ysw'").getText(), "'foo 'bar");
+  assert.equal(runNormal("foo bar", "0yse'").getText(), "'foo' bar");
+  assert.equal(runNormal("ab", "0yss]").getText(), "[ab]");
+  assert.equal(runNormal('say "hi"', '0fhds"').getText(), "say hi");
+  assert.equal(runNormal("<a>", "0lds<").getText(), "a");
+  assert.equal(runNormal('"hi"', "0lcs\"'").getText(), "'hi'");
+  assert.equal(runNormal('"hi"', '0lcs"[').getText(), "[ hi ]");
+  // vim-surround `b` stays `()` even in sandwich mode.
+  assert.equal(runNormal('("x")', "0fxdsb").getText(), '"x"');
+  assert.equal(runNormal("hello", '0viwS"').getText(), '"hello"');
+});
+
+test("surroundKeymap=surround restores vim s / visual s / ib=()", () => {
+  const sub = runNormal("abc", "0s", "surround");
+  assert.equal(sub.getText(), "bc");
+  assert.ok(sub.render(40).every((l) => !l.includes("NORMAL")));
+  assert.equal(runNormal("abc def", "0viwsX", "surround").getText(), "X def");
+  assert.equal(runNormal('f(a, "b")', "0fbdib", "surround").getText(), "f()");
+  assert.equal(
+    runNormal("x 'abc' y", "0fbdis'", "surround").getText(),
+    "x 'abc' y",
+  );
+});
+
+test("surroundKeymap setting: project overrides global, invalid ignored", () => {
+  const g = { ompVim: { surroundKeymap: "surround" } };
+  assert.equal(readPiVimSurroundKeymap(g, undefined), "surround");
+  assert.equal(
+    readPiVimSurroundKeymap(g, { ompVim: { surroundKeymap: "sandwich" } }),
+    "sandwich",
+  );
+  assert.equal(
+    readPiVimSurroundKeymap(g, { ompVim: { surroundKeymap: "bogus" } }),
+    undefined,
+  );
+  assert.equal(readPiVimSurroundKeymap(undefined, undefined), undefined);
 });

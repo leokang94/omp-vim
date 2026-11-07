@@ -41,15 +41,36 @@ Features this fork adds on top of upstream pi-vim:
 - `v` charwise, `V` linewise. The selection is highlighted and the block cursor marks the active end.
 - Motions extend the selection in both directions (`h/j/k/l`, `w/b/e/W/B/E`, `0/$/^`, `gg/G`, `f/t/;/,`, `%`, `{/}`); `o` swaps the active end. Horizontal motions (`h`/`l`/arrows) never rest past the last character (vim parity), so backward selections always include the anchor char. Vertical `j`/`k` keep the base editor's sticky-column behavior and may rest at a short line's end — selection math still includes that line's last char.
 - Text objects select their range: `iw/aw/iW/aW` and quote/bracket objects (`i"`, `a(`, `ab`, `aB`, …).
-- Operators act on the selection: `d`/`x` delete, `c`/`s` change, `y` yank, `p`/`P` replace with the register, `r{char}` replace every selected char, `S{char}` surround the selection. `Esc` returns to normal mode.
+- Operators act on the selection: `d`/`x` delete, `c` change, `y` yank, `p`/`P` replace with the register, `r{char}` replace every selected char, `S{char}` surround the selection. `s` is the vim-sandwich prefix (`sa`/`sd`/`sr`, see below); with `surroundKeymap: "surround"` it changes the selection like `c`. `Esc` returns to normal mode.
 
 ### surround.vim (subset)
 
 - `ds{target}` — delete the surrounding pair (e.g. `ds"` on `"hello"` → `hello`).
 - `cs{target}{replacement}` — change the surrounding pair (e.g. `cs'"` on `'hello'` → `"hello"`).
-- `ys{textobject}{char}` — add a surrounding pair around a text object (e.g. `ysiw)` wraps the word in parens; `yss"` wraps the whole line).
+- `ys{motion}{char}` — add a surrounding pair (e.g. `ysiw)` wraps the word in parens; `yss"` wraps the whole line).
 
-Targets/replacements: `( ) b`, `{ } B`, `[ ] r`, `< >`, `"`, `'`, `` ` ``. Opening brackets (`( [ { <`) add inner spaces (`( x )`); closing forms and letters are tight (`(x)`). `ys` supports text objects (`iw`/`aw`/`i"`/…), `yss` (whole line), and `$`.
+Targets/replacements: `( ) b`, `{ } B`, `[ ] r`, `< >`, `"`, `'`, `` ` ``. Opening brackets (`( [ { <`) add inner spaces (`( x )`); closing forms and letters are tight (`(x)`). `ys` motions: text objects (`iw`/`aw`/`i"`/…), `yss` (whole line), `w W e E b B 0 ^ $`, and `f t F T{char}`.
+
+### vim-sandwich keymap (default)
+
+[machakann/vim-sandwich](https://github.com/machakann/vim-sandwich)'s default operators and text objects. Active by default (`surroundKeymap: "sandwich"`); the surround.vim commands above keep working alongside.
+
+| mode | keys | action |
+|---|---|---|
+| normal | `sa{motion}{char}` | add a pair around the motion (`saiw'` → `'word'`, `sa$)`) |
+| visual | `sa{char}` | add a pair around the selection |
+| normal | `sd{char}` / `sdb` | delete the pair around the cursor; `b` picks the nearest pair of any kind |
+| normal | `sr{old}{new}` / `srb{new}` | replace the pair around the cursor; `b` picks the nearest pair |
+| visual | `sd` / `sr{new}` | delete/replace the selection's own first and last characters when they form a pair |
+| op-pending, visual | `ib` / `ab` | inside/around the nearest pair of any kind (`dib`, `vab`, `saib"`) |
+| op-pending, visual | `is{char}` / `as{char}` | inside/around the given pair (`dis'`, `vas(`, `sais'"`) |
+
+- `sa` never pads: `(` and `)` both give `(x)` (sandwich's default recipes), unlike `ys`.
+- `sa` accepts the same motions as `ys` (minus `yss`).
+- Nearest-pair candidates: `()`, `[]`, `{}`, `<>`, `"`, `'`, `` ` ``. The pair with the narrowest outer range around the cursor wins.
+- `s` is a prefix in normal and visual mode: vim's `s` (substitute) and visual `s` (change) are gone, matching sandwich's recommended `nmap s <Nop>`. Use `cl` / visual `c`, or set `surroundKeymap: "surround"`. A key after `s` that is not `a`/`d`/`r` runs as a normal command.
+- `ib`/`ab` auto-detect instead of meaning `()`; `i(`/`a(` still target parens only.
+- Function (`f`) and tag (`t`) recipes are not implemented.
 
 ### Redo
 
@@ -92,7 +113,8 @@ Default-equivalent `settings.json`:
       "normal": "borderAccent",
       "ex": "warning"
     },
-    "syncBorderColorWithMode": false
+    "syncBorderColorWithMode": false,
+    "surroundKeymap": "sandwich"
   }
 }
 ```
@@ -102,6 +124,8 @@ All keys are optional; omitting `ompVim` is equivalent. Project overrides global
 `clipboardMirror`: `all` mirrors unnamed writes; `yank` mirrors yanks; `never` keeps writes internal. Non-mirrored writes stay local for `p` / `P`.
 
 `syncBorderColorWithMode`: `false` keeps the thinking border; `true` follows mode colors.
+
+`surroundKeymap`: `sandwich` (default) enables the vim-sandwich `s` prefix and auto-detecting `ib`/`ab`/`is`/`as`; `surround` restores vim's `s`, visual `s`, and `ib` = `()`. surround.vim `ys`/`ds`/`cs`/visual `S` work under both.
 
 `modeChange`: user-global shell command to run on every transition into the named mode. Both keys are optional. The command runs asynchronously via the system shell, stdio is discarded, failures are silenced, and a hung command is timed out so editing never blocks or breaks. If mode changes happen while a hook command is still running, omp-vim keeps only the latest pending command. Hooks fire only on actual transitions: not on the initial mode, not on EX entry/exit (EX is a sub-state of normal), and not on no-op `Esc` from normal. Because this is arbitrary shell, project `.omp/settings.json` values are ignored. omp-vim also emits `omp-vim:mode-change` on `pi.events` with `{ mode, previousMode }` for other extensions. Typical use is IME auto-switching via the third-party [`im-select`](https://github.com/daipeihust/im-select) CLI (cross-platform: macOS / Windows / Linux). Install per its README, then run `im-select` with no args to print your current IME id and plug those ids into the global config:
 
@@ -295,9 +319,12 @@ Text objects compose as `d`/`c`/`y` + `i`/`a` + object. `i` means inner; `a` mea
 | word | `iw` / `aw` | Keyword word; `aw` includes spaces |
 | WORD | `iW` / `aW` | Line-local whitespace-delimited WORD; `aW` includes adjacent whitespace |
 | quotes | `i"` / `a"`, `i'` / `a'`, <code>i`</code> / <code>a`</code> | Smallest containing quote pair on the line |
-| parentheses | `i(` / `a(`; aliases `i)` / `a)`, `ib` / `ab` | Smallest containing pair |
+| parentheses | `i(` / `a(`; aliases `i)` / `a)` (`ib` / `ab` with `surroundKeymap: "surround"`) | Smallest containing pair |
 | brackets | `i[` / `a[`; aliases `i]` / `a]` | Smallest containing pair |
 | braces | `i{` / `a{`; aliases `i}` / `a}`, `iB` / `aB` | Smallest containing pair |
+| angle brackets | `i<` / `a<`; aliases `i>` / `a>` | Smallest containing pair |
+| nearest pair (sandwich) | `ib` / `ab` | Smallest containing pair of any kind above |
+| given pair (sandwich) | `is{char}` / `as{char}` | Smallest containing `{char}` pair |
 
 Semantics:
 - WORD objects are line-local and whitespace-delimited.
@@ -427,7 +454,7 @@ Put reads the OS clipboard first unless the last local register write was not mi
 | `0` / `$` operators | Exclusive of the anchor col | `0` is inclusive of col 0 |
 | Undo / redo | Delegates undo to readline; normal-mode `<C-r>` redo is supported | Full per-change undo tree |
 | Visual mode | Not implemented | `v`, `V`, `<C-v>` |
-| Text objects | `iw` / `aw`, `iW` / `aW`, quote objects, and paren/bracket/brace objects; delimited counts cancel | Full text-object set |
+| Text objects | `iw` / `aw`, `iW` / `aW`, quote objects, paren/bracket/brace/angle objects, and vim-sandwich `ib`/`ab`/`is`/`as`; delimited counts cancel | Full text-object set |
 | `%` matching | `()`, `[]`, `{}` only; lexical same-delimiter matching with no counts, quote/angle matching, parser/matchit logic, mixed-delimiter validation, or Visual `%` yet | Also supports percentage jumps and broader matching |
 | Count prefix | Operators, motions, navigation, `x`, `r`, `p`, `P`; capped at `MAX_COUNT=9999` | Full support |
 | Registers / macros / search | Not implemented | Supported |

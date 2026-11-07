@@ -13,11 +13,14 @@ export type ModeChangeSettings = {
   normal?: string;
 };
 
+export type SurroundKeymap = "surround" | "sandwich";
+
 export type PiVimSettings = {
   clipboardMirror?: unknown;
   modeColors?: ModeColorSettings;
   modeChange?: ModeChangeSettings;
   syncBorderColorWithMode?: boolean;
+  surroundKeymap?: SurroundKeymap;
 };
 
 const M = Symbol(),
@@ -97,6 +100,19 @@ export function readPiVimBooleanSetting(
   return typeof w === "boolean" ? w : undefined;
 }
 
+const isSurroundKeymap = (v: unknown): v is SurroundKeymap =>
+  v === "surround" || v === "sandwich";
+
+export function readPiVimSurroundKeymap(
+  g: unknown,
+  p: unknown,
+): SurroundKeymap | undefined {
+  const v = get(p, "surroundKeymap");
+  if (v !== M) return isSurroundKeymap(v) ? v : undefined;
+  const w = get(g, "surroundKeymap");
+  return isSurroundKeymap(w) ? w : undefined;
+}
+
 function loadSettingsFile(path: string): unknown {
   try {
     if (!existsSync(path)) return undefined;
@@ -118,6 +134,7 @@ function disk(cwd: string): PiVimSettings {
       p,
       "syncBorderColorWithMode",
     ),
+    surroundKeymap: readPiVimSurroundKeymap(g, p),
   };
 }
 

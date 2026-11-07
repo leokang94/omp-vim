@@ -30,10 +30,12 @@ import {
   type ModeChangeSettings,
   type ModeColorSettings,
   readPiVimSettings,
+  type SurroundKeymap,
 } from "./settings.js";
 import {
   resolveDelimitedTextObjectRange,
   resolveMatchingPairMotionTarget,
+  resolveNearestDelimitedPair,
   resolveWordTextObjectRange,
   type TextObjectKind,
   type TextObjectRange,
@@ -155,12 +157,29 @@ type RunningModeChangeCommand = {
   timeout: ReturnType<typeof setTimeout>;
 };
 type ModeChangeEvent = { mode: Mode; previousMode: Mode };
+// "surround" = vim-surround (`ys`/`ds`/`cs`/visual `S`): opening brackets pad
+// with spaces and `b` means `()`. "sandwich" = vim-sandwich (`sa`/`sd`/`sr`):
+// never pads and `b` auto-detects the nearest pair.
+type SurroundStyle = "surround" | "sandwich";
+type SurroundAddState =
+  | { op: "y"; style: SurroundStyle; stage: "motion" }
+  | { op: "y"; style: SurroundStyle; stage: "textobject"; kind: TextObjectKind }
+  | { op: "y"; style: SurroundStyle; stage: "query"; kind: TextObjectKind }
+  | { op: "y"; style: SurroundStyle; stage: "charMotion"; motion: CharMotion }
+  | {
+      op: "y";
+      style: SurroundStyle;
+      stage: "char";
+      startAbs: number;
+      endAbs: number;
+    };
 type SurroundState =
-  | { op: "d" }
-  | { op: "c"; target: string | null }
-  | { op: "y"; stage: "motion" }
-  | { op: "y"; stage: "textobject"; kind: TextObjectKind }
-  | { op: "y"; stage: "char"; startAbs: number; endAbs: number };
+  | { op: "prefix" }
+  | { op: "visualPrefix" }
+  | { op: "visualReplace"; startAbs: number; endAbs: number }
+  | { op: "d"; style: SurroundStyle }
+  | { op: "c"; style: SurroundStyle; target: string | null }
+  | SurroundAddState;
 
 type ModeColorKey = keyof typeof MODE_COLORS;
 type ModeColorizers = Record<ModeColorKey, (s: string) => string>;
@@ -500,6 +519,7 @@ export class ModalEditor extends CustomEditor {
   private mode: Mode = "insert";
   private pendingMotion: PendingMotion = null;
   private pendingTextObject: TextObjectKind | null = null;
+  private pendingTextObjectQuery: TextObjectKind | null = null;
   private pendingOperator: PendingOperator = null;
   private prefixCount: string = "";
   private operatorCount: string = "";
@@ -512,6 +532,7 @@ export class ModalEditor extends CustomEditor {
   private visualAnchor: number | null = null;
   private visualReplacePending: boolean = false;
   private surround: SurroundState | null = null;
+  private surroundKeymap: SurroundKeymap = "sandwich";
   private textWidth: number = 120;
   private formatOptions: string = "at";
   private effectiveTextWidth: number = 0;
@@ -570,6 +591,9 @@ export class ModalEditor extends CustomEditor {
   }
   setClipboardMirrorPolicy(policy: ClipboardMirrorPolicy): void {
     this.clipboardMirrorPolicy = policy;
+  }
+  setSurroundKeymap(keymap: SurroundKeymap): void {
+    this.surroundKeymap = keymap;
   }
   getClipboardMirrorPolicy(): ClipboardMirrorPolicy {
     return this.clipboardMirrorPolicy;
@@ -764,6 +788,7 @@ export class ModalEditor extends CustomEditor {
   private clearPendingState(): void {
     this.pendingMotion = null;
     this.pendingTextObject = null;
+    this.pendingTextObjectQuery = null;
     this.pendingOperator = null;
     this.prefixCount = "";
     this.operatorCount = "";
@@ -982,6 +1007,11 @@ export class ModalEditor extends CustomEditor {
       return;
     }
 
+    if (this.pendingTextObjectQuery) {
+      this.handlePendingTextObjectQuery(data);
+      return;
+    }
+
     if (this.pendingTextObject) {
       this.handlePendingTextObject(data);
       return;
@@ -1051,6 +1081,7 @@ export class ModalEditor extends CustomEditor {
     if (
       this.pendingMotion ||
       this.pendingTextObject ||
+      this.pendingTextObjectQuery ||
       this.pendingOperator ||
       this.prefixCount ||
       this.operatorCount ||
@@ -1749,6 +1780,22 @@ export class ModalEditor extends CustomEditor {
       return;
     }
 
+    if (this.surroundKeymap === "sandwich") {
+      if (data === "s") {
+        this.pendingTextObjectQuery = pendingTextObject;
+        return;
+      }
+      if (data === "b") {
+        const nearest = this.resolveNearestTextObjectRange(pendingTextObject);
+        if (!nearest) {
+          this.cancelPendingOperator(data);
+          return;
+        }
+        this.applyResolvedTextObjectRange(nearest);
+        return;
+      }
+    }
+
     const range = resolveDelimitedTextObjectRange(
       this.getText(),
       this.getDelimitedTextObjectCursorAbs(),
@@ -1761,6 +1808,34 @@ export class ModalEditor extends CustomEditor {
     }
 
     this.applyResolvedTextObjectRange(range);
+  }
+
+  private handlePendingTextObjectQuery(data: string): void {
+    const kind = this.pendingTextObjectQuery;
+    this.pendingTextObjectQuery = null;
+    if (!kind) return;
+    const range = resolveDelimitedTextObjectRange(
+      this.getText(),
+      this.getDelimitedTextObjectCursorAbs(),
+      kind,
+      data,
+    );
+    if (!range) {
+      this.cancelPendingOperator(data);
+      return;
+    }
+    this.applyResolvedTextObjectRange(range);
+  }
+
+  private resolveNearestTextObjectRange(
+    kind: TextObjectKind,
+  ): TextObjectRange | null {
+    const pair = resolveNearestDelimitedPair(
+      this.getText(),
+      this.getDelimitedTextObjectCursorAbs(),
+    );
+    if (!pair) return null;
+    return kind === "i" ? pair.inner : pair.outer;
   }
 
   private applyResolvedTextObjectRange(range: TextObjectRange): void {
@@ -1801,7 +1876,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "d" };
+      this.surround = { op: "d", style: "surround" };
       return;
     }
 
@@ -1883,7 +1958,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "c", target: null };
+      this.surround = { op: "c", style: "surround", target: null };
       return;
     }
 
@@ -1987,6 +2062,15 @@ export class ModalEditor extends CustomEditor {
       }
 
       this.clearPendingState();
+      return;
+    }
+
+    if (data === "s" && this.surroundKeymap === "sandwich") {
+      // vim-sandwich prefix: `sa`/`sd`/`sr`. Drops any count, like sandwich's
+      // recommended `nmap s <Nop>`.
+      this.prefixCount = "";
+      this.operatorCount = "";
+      this.surround = { op: "prefix" };
       return;
     }
 
@@ -2435,6 +2519,7 @@ export class ModalEditor extends CustomEditor {
     this.exitVisualToNormal();
     this.surround = {
       op: "y",
+      style: "surround",
       stage: "char",
       startAbs: range.startAbs,
       endAbs: range.endAbs,
@@ -2473,8 +2558,14 @@ export class ModalEditor extends CustomEditor {
       case "D":
         this.deleteVisualSelection();
         return;
-      case "c":
       case "s":
+        if (this.surroundKeymap === "sandwich") {
+          this.surround = { op: "visualPrefix" };
+          return;
+        }
+        this.changeVisualSelection();
+        return;
+      case "c":
       case "C":
       case "R":
         this.changeVisualSelection();
@@ -2542,15 +2633,27 @@ export class ModalEditor extends CustomEditor {
     }
   }
 
-  private surroundOpenPadding(ch: string): string {
+  private surroundPadding(style: SurroundStyle, ch: string): string {
+    if (style === "sandwich") return "";
     return ch === "(" || ch === "[" || ch === "{" || ch === "<" ? " " : "";
   }
 
   private resolveSurroundTarget(
     target: string,
+    style: SurroundStyle,
   ): { aStart: number; aEnd: number; iStart: number; iEnd: number } | null {
     const text = this.getText();
     const cursorAbs = this.getDelimitedTextObjectCursorAbs();
+    if (style === "sandwich" && target === "b") {
+      const pair = resolveNearestDelimitedPair(text, cursorAbs);
+      if (!pair) return null;
+      return {
+        aStart: pair.outer.startAbs,
+        aEnd: pair.outer.endAbs,
+        iStart: pair.inner.startAbs,
+        iEnd: pair.inner.endAbs,
+      };
+    }
     const outer = resolveDelimitedTextObjectRange(text, cursorAbs, "a", target);
     const inner = resolveDelimitedTextObjectRange(text, cursorAbs, "i", target);
     if (!outer || !inner) return null;
@@ -2562,8 +2665,8 @@ export class ModalEditor extends CustomEditor {
     };
   }
 
-  private applySurroundDelete(target: string): void {
-    const r = this.resolveSurroundTarget(target);
+  private applySurroundDelete(target: string, style: SurroundStyle): void {
+    const r = this.resolveSurroundTarget(target, style);
     if (!r) return;
     const text = this.getText();
     const inner = text.slice(r.iStart, r.iEnd);
@@ -2573,14 +2676,18 @@ export class ModalEditor extends CustomEditor {
     );
   }
 
-  private applySurroundChange(target: string, replacement: string): void {
+  private applySurroundChange(
+    target: string,
+    replacement: string,
+    style: SurroundStyle,
+  ): void {
     const pair = this.surroundPair(replacement);
     if (!pair) return;
-    const r = this.resolveSurroundTarget(target);
+    const r = this.resolveSurroundTarget(target, style);
     if (!r) return;
     const text = this.getText();
     const inner = text.slice(r.iStart, r.iEnd);
-    const pad = this.surroundOpenPadding(replacement);
+    const pad = this.surroundPadding(style, replacement);
     this.replaceTextInBuffer(
       text.slice(0, r.aStart) +
         pair[0] +
@@ -2597,12 +2704,13 @@ export class ModalEditor extends CustomEditor {
     startAbs: number,
     endAbs: number,
     char: string,
+    style: SurroundStyle,
   ): void {
     const pair = this.surroundPair(char);
     if (!pair) return;
     const text = this.getText();
     const content = text.slice(startAbs, endAbs);
-    const pad = this.surroundOpenPadding(char);
+    const pad = this.surroundPadding(style, char);
     this.replaceTextInBuffer(
       text.slice(0, startAbs) +
         pair[0] +
@@ -2615,97 +2723,207 @@ export class ModalEditor extends CustomEditor {
     );
   }
 
+  /**
+   * Visual `sd` (replacement null) / `sr{new}`: vim-sandwich treats the
+   * selection's own first and last characters as the pair to remove/replace.
+   */
+  private applyVisualSandwichEnds(
+    startAbs: number,
+    endAbs: number,
+    replacement: string | null,
+  ): void {
+    const text = this.getText();
+    if (endAbs - startAbs < 2) return;
+    const first = text[startAbs] ?? "";
+    const existing = this.surroundPair(first);
+    if (!existing || existing[0] !== first || existing[1] !== text[endAbs - 1])
+      return;
+    const next =
+      replacement === null ? ["", ""] : this.surroundPair(replacement);
+    if (!next) return;
+    this.replaceTextInBuffer(
+      text.slice(0, startAbs) +
+        next[0] +
+        text.slice(startAbs + 1, endAbs - 1) +
+        next[1] +
+        text.slice(endAbs),
+      startAbs,
+    );
+  }
+
   private resolveSurroundObjectRange(
     kind: TextObjectKind,
     key: string,
-  ): { startAbs: number; endAbs: number } | null {
+  ): TextObjectRange | null {
     if (key === "w" || key === "W") {
-      const range = this.getWordObjectRange(
-        kind,
-        1,
-        key === "W" ? "WORD" : "word",
-      );
-      return range ? { startAbs: range.startAbs, endAbs: range.endAbs } : null;
+      return this.getWordObjectRange(kind, 1, key === "W" ? "WORD" : "word");
     }
-    const range = resolveDelimitedTextObjectRange(
+    if (key === "b" && this.surroundKeymap === "sandwich") {
+      return this.resolveNearestTextObjectRange(kind);
+    }
+    return resolveDelimitedTextObjectRange(
       this.getText(),
       this.getDelimitedTextObjectCursorAbs(),
       kind,
       key,
     );
-    return range ? { startAbs: range.startAbs, endAbs: range.endAbs } : null;
   }
 
   private handleSurroundInput(data: string): void {
     const state = this.surround;
     if (!state) return;
+    // Each handler re-arms `this.surround` only when it needs another key.
+    this.surround = null;
 
-    if (state.op === "d") {
-      this.surround = null;
-      this.applySurroundDelete(data);
-      return;
-    }
-
-    if (state.op === "c") {
-      if (state.target === null) {
-        state.target = data;
+    switch (state.op) {
+      case "prefix":
+        this.handleSandwichPrefix(data);
         return;
+      case "visualPrefix":
+        this.handleVisualSandwichPrefix(data);
+        return;
+      case "visualReplace":
+        this.applyVisualSandwichEnds(state.startAbs, state.endAbs, data);
+        return;
+      case "d":
+        this.applySurroundDelete(data, state.style);
+        return;
+      case "c":
+        if (state.target === null) {
+          this.surround = { ...state, target: data };
+          return;
+        }
+        this.applySurroundChange(state.target, data, state.style);
+        return;
+      case "y":
+        this.handleSurroundAddInput(state, data);
+        return;
+      default: {
+        const unreachable: never = state;
+        void unreachable;
       }
-      this.surround = null;
-      this.applySurroundChange(state.target, data);
+    }
+  }
+
+  private handleSandwichPrefix(data: string): void {
+    switch (data) {
+      case "a":
+        this.surround = { op: "y", style: "sandwich", stage: "motion" };
+        return;
+      case "d":
+        this.surround = { op: "d", style: "sandwich" };
+        return;
+      case "r":
+        this.surround = { op: "c", style: "sandwich", target: null };
+        return;
+      default:
+        // `s` alone is a no-op prefix; the next key runs as a normal command.
+        this.handleNormalMode(data);
+    }
+  }
+
+  private handleVisualSandwichPrefix(data: string): void {
+    if (data !== "a" && data !== "d" && data !== "r") {
+      this.handleVisualMode(data);
       return;
     }
+    const range =
+      this.mode === "visualLine"
+        ? this.visualLineAbsRange()
+        : this.getVisualRange();
+    this.exitVisualToNormal();
+    if (data === "a") {
+      this.armSurroundAdd("sandwich", range);
+    } else if (data === "d") {
+      this.applyVisualSandwichEnds(range.startAbs, range.endAbs, null);
+    } else {
+      this.surround = {
+        op: "visualReplace",
+        startAbs: range.startAbs,
+        endAbs: range.endAbs,
+      };
+    }
+  }
 
-    if (state.stage === "char") {
-      this.surround = null;
-      this.applySurroundAdd(state.startAbs, state.endAbs, data);
+  private handleSurroundAddInput(state: SurroundAddState, data: string): void {
+    const { style } = state;
+    switch (state.stage) {
+      case "char":
+        this.applySurroundAdd(state.startAbs, state.endAbs, data, style);
+        return;
+      case "textobject":
+        if (data === "s" && this.surroundKeymap === "sandwich") {
+          this.surround = { op: "y", style, stage: "query", kind: state.kind };
+          return;
+        }
+        this.armSurroundAdd(
+          style,
+          this.resolveSurroundObjectRange(state.kind, data),
+        );
+        return;
+      case "query":
+        this.armSurroundAdd(
+          style,
+          resolveDelimitedTextObjectRange(
+            this.getText(),
+            this.getDelimitedTextObjectCursorAbs(),
+            state.kind,
+            data,
+          ),
+        );
+        return;
+      case "charMotion":
+        this.armSurroundAdd(
+          style,
+          this.resolveCharMotionAbsRange(state.motion, data),
+        );
+        return;
+      case "motion":
+        this.handleSurroundMotion(style, data);
+        return;
+    }
+  }
+
+  private handleSurroundMotion(style: SurroundStyle, data: string): void {
+    if (data === "i" || data === "a") {
+      this.surround = { op: "y", style, stage: "textobject", kind: data };
       return;
     }
-
-    if (state.stage === "textobject") {
-      const range = this.resolveSurroundObjectRange(state.kind, data);
-      this.surround = range
-        ? {
-            op: "y",
-            stage: "char",
-            startAbs: range.startAbs,
-            endAbs: range.endAbs,
-          }
-        : null;
-      return;
-    }
-
-    if (data === "s") {
-      const line = this.getCursor().line;
+    if (CHAR_MOTION_KEYS.has(data)) {
       this.surround = {
         op: "y",
-        stage: "char",
+        style,
+        stage: "charMotion",
+        motion: data as CharMotion,
+      };
+      return;
+    }
+    if (data === "s" && style === "surround") {
+      const line = this.getCursor().line;
+      this.armSurroundAdd(style, {
         startAbs: this.getAbsoluteIndex(line, 0),
         endAbs: this.getAbsoluteIndex(
           line,
           (this.getLines()[line] ?? "").length,
         ),
-      };
+      });
       return;
     }
-    if (data === "i" || data === "a") {
-      this.surround = { op: "y", stage: "textobject", kind: data };
-      return;
-    }
-    if (data === "$") {
-      const cursor = this.getCursor();
-      this.surround = {
-        op: "y",
-        stage: "char",
-        startAbs: this.getAbsoluteIndexFromCursor(),
-        endAbs: this.getAbsoluteIndex(
-          cursor.line,
-          (this.getLines()[cursor.line] ?? "").length,
-        ),
-      };
-      return;
-    }
-    this.surround = null;
+    this.armSurroundAdd(style, this.resolveMotionAbsRange(data));
+  }
+
+  private armSurroundAdd(
+    style: SurroundStyle,
+    range: TextObjectRange | null,
+  ): void {
+    if (!range || range.endAbs <= range.startAbs) return;
+    this.surround = {
+      op: "y",
+      style,
+      stage: "char",
+      startAbs: range.startAbs,
+      endAbs: range.endAbs,
+    };
   }
 
   private openLineBelow(): void {
@@ -3590,7 +3808,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "y", stage: "motion" };
+      this.surround = { op: "y", style: "surround", stage: "motion" };
       return;
     }
 
@@ -3656,64 +3874,64 @@ export class ModalEditor extends CustomEditor {
     }
   }
 
-  private yankWithMotion(motion: string): boolean {
+  /**
+   * Range a plain motion covers from the cursor. Null for unsupported motions;
+   * an empty range (startAbs === endAbs) is a valid motion that covers nothing.
+   */
+  private resolveMotionAbsRange(motion: string): TextObjectRange | null {
     const cursor = this.getCursor();
     const line = this.getLines()[cursor.line] ?? "";
     const col = cursor.col;
 
-    if (motion === "$") {
-      this.yankRange(col, line.length, false);
-      return true;
-    }
-
-    if (motion === "0") {
-      this.yankRange(col, 0, false);
-      return true;
-    }
-
+    if (motion === "$") return this.lineColAbsRange(col, line.length, false);
+    if (motion === "0") return this.lineColAbsRange(col, 0, false);
     if (motion === "^") {
-      this.yankRange(col, findFirstNonWhitespaceColumn(line), false);
-      return true;
+      return this.lineColAbsRange(
+        col,
+        findFirstNonWhitespaceColumn(line),
+        false,
+      );
     }
 
     const wordMotion = this.resolveWordMotion(motion);
-    if (wordMotion) {
-      const lineLocalRange = this.tryWordMotionLineLocalRange(
-        wordMotion.motion,
-        1,
-        wordMotion.semanticClass,
-      );
-      if (lineLocalRange) {
-        this.yankRange(
-          lineLocalRange.col,
-          lineLocalRange.targetCol,
-          lineLocalRange.inclusive,
-        );
-        return true;
-      }
+    if (!wordMotion) return null;
 
-      const text = this.getText();
-      const currentAbs = this.getAbsoluteIndexFromCursor();
-      const targetAbs = this.findWordTargetInText(
-        text,
-        currentAbs,
-        wordMotion.motion === "b" ? "backward" : "forward",
-        wordMotion.motion === "e" ? "end" : "start",
-        1,
-        wordMotion.semanticClass,
+    const lineLocalRange = this.tryWordMotionLineLocalRange(
+      wordMotion.motion,
+      1,
+      wordMotion.semanticClass,
+    );
+    if (lineLocalRange) {
+      return this.lineColAbsRange(
+        lineLocalRange.col,
+        lineLocalRange.targetCol,
+        lineLocalRange.inclusive,
       );
-      this.yankRangeByAbsolute(
-        currentAbs,
-        targetAbs,
-        wordMotion.motion === "e",
-      );
-      return true;
     }
 
-    return false;
+    const text = this.getText();
+    const currentAbs = this.getAbsoluteIndexFromCursor();
+    const targetAbs = this.findWordTargetInText(
+      text,
+      currentAbs,
+      wordMotion.motion === "b" ? "backward" : "forward",
+      wordMotion.motion === "e" ? "end" : "start",
+      1,
+      wordMotion.semanticClass,
+    );
+    const startAbs = Math.min(currentAbs, targetAbs);
+    const rawEnd =
+      Math.max(currentAbs, targetAbs) + (wordMotion.motion === "e" ? 1 : 0);
+    return {
+      startAbs,
+      endAbs: Math.max(startAbs, Math.min(rawEnd, text.length)),
+    };
   }
 
-  private yankWithCharMotion(motion: CharMotion, targetChar: string): void {
+  private resolveCharMotionAbsRange(
+    motion: CharMotion,
+    targetChar: string,
+  ): TextObjectRange | null {
     const line = this.getLines()[this.getCursor().line] ?? "";
     const col = this.getCursor().col;
     const count = this.takeTotalCount(1);
@@ -3726,14 +3944,19 @@ export class ModalEditor extends CustomEditor {
       count,
     );
 
-    if (targetCol === null) return;
+    if (targetCol === null) return null;
 
     this.lastCharMotion = { motion, char: targetChar };
-    this.yankRange(col, targetCol, true);
+    return this.lineColAbsRange(col, targetCol, true);
   }
 
-  private yankRange(col: number, targetCol: number, inclusive: boolean): void {
-    const line = this.getLines()[this.getCursor().line] ?? "";
+  private lineColAbsRange(
+    col: number,
+    targetCol: number,
+    inclusive: boolean,
+  ): TextObjectRange {
+    const cursorLine = this.getCursor().line;
+    const line = this.getLines()[cursorLine] ?? "";
     const start = Math.min(col, targetCol);
     const rawEnd = Math.max(col, targetCol) + (inclusive ? 1 : 0);
     let end = Math.min(rawEnd, line.length);
@@ -3747,9 +3970,30 @@ export class ModalEditor extends CustomEditor {
       end = targetRange?.end ?? end;
     }
 
-    if (end <= start) return;
+    const lineStartAbs = this.getAbsoluteIndex(cursorLine, 0);
+    return {
+      startAbs: lineStartAbs + start,
+      endAbs: lineStartAbs + Math.max(start, end),
+    };
+  }
 
-    this.writeToRegister(line.slice(start, end), "yank");
+  private yankAbsRange(range: TextObjectRange | null): void {
+    if (!range || range.endAbs <= range.startAbs) return;
+    this.writeToRegister(
+      this.getText().slice(range.startAbs, range.endAbs),
+      "yank",
+    );
+  }
+
+  private yankWithMotion(motion: string): boolean {
+    const range = this.resolveMotionAbsRange(motion);
+    if (!range) return false;
+    this.yankAbsRange(range);
+    return true;
+  }
+
+  private yankWithCharMotion(motion: CharMotion, targetChar: string): void {
+    this.yankAbsRange(this.resolveCharMotionAbsRange(motion, targetChar));
   }
 
   private yankRangeByAbsolute(
@@ -3986,7 +4230,6 @@ export class ModalEditor extends CustomEditor {
       return;
     }
 
-
     const sequence = this.getDesiredCursorShapeSequence();
     if (sequence === this.lastCursorShapeSequence) return;
 
@@ -4052,10 +4295,7 @@ export class ModalEditor extends CustomEditor {
       if (pos) {
         start = this.getAbsoluteIndex(pos.line, pos.startCol);
       } else {
-        while (
-          abs < text.length &&
-          (text[abs] === "\n" || abs === cursorAbs)
-        ) {
+        while (abs < text.length && (text[abs] === "\n" || abs === cursorAbs)) {
           abs++;
         }
         if (text.slice(abs, abs + segment.length) !== segment) {
@@ -4270,6 +4510,9 @@ export default function (pi: ExtensionAPI) {
         borderColorizers,
       });
       editor.setClipboardMirrorPolicy(clipboardMirrorPolicy.policy);
+      if (piVimSettings.surroundKeymap) {
+        editor.setSurroundKeymap(piVimSettings.surroundKeymap);
+      }
       editor.setQuitFn(() => ctx.shutdown());
       editor.setNotifyFn((message) => ctx.ui.notify(message, "warning"));
       editor.setModeChangeFn(modeChangeHandler);
