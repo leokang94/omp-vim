@@ -4,19 +4,21 @@ Modal vim-like editing for [Oh My Pi](https://github.com/can1357/oh-my-pi)'s inp
 
 This is an Oh My Pi port of [`pi-vim`](https://github.com/lajarre/pi-vim) by lajarre. See [Oh My Pi port](#oh-my-pi-port) for what changed and current limitations.
 
+**This fork** ([`leokang94/omp-vim`](https://github.com/leokang94/omp-vim)) follows [`boazy/omp-vim`](https://github.com/boazy/omp-vim) and adds the [vim-sandwich keymap](#vim-sandwich-keymap-default) (`sa`/`sd`/`sr`, `ib`/`ab`/`is`/`as`, pending-key label, target highlight, post-op flash). Behavior change vs boazy: normal/visual `s` is the sandwich prefix by default; set `ompVim.surroundKeymap` to `"surround"` to restore vim's `s` (see [configure](#configure)).
+
 ## install
 
 From a local checkout:
 
 ```bash
-git clone https://github.com/boazy/omp-vim
+git clone https://github.com/leokang94/omp-vim
 omp plugin install ./omp-vim
 ```
 
 Or directly from git:
 
 ```bash
-omp plugin install git+https://github.com/boazy/omp-vim
+omp plugin install git+https://github.com/leokang94/omp-vim
 ```
 
 Restart Oh My Pi after install. Only one prompt-editor extension can be active at a time.

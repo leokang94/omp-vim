@@ -2,6 +2,8 @@
 
 This is an Oh My Pi port of [lajarre/pi-vim](https://github.com/lajarre/pi-vim), published as `omp-vim`. It targets Oh My Pi's `@oh-my-pi/*` API and compiled-binary runtime. See the "Oh My Pi port" section in `README.md` for the concrete adaptations (native in-process clipboard, buffer/cursor engine rerouted onto the public `Editor` API, self-contained snapshot undo, settings read from `~/.omp`).
 
+This repo (`leokang94/omp-vim`) is a fork of `boazy/omp-vim`. The vim-sandwich keymap (`surroundKeymap` setting, `sa`/`sd`/`sr`, sandwich `ib`/`ab`/`is`/`as`, pending-key label/highlight/flash) exists only in this fork. When syncing from upstream (`boazy/omp-vim`), rebase onto it and keep these features and their tests in `test/omp-features.test.ts` passing; do not open PRs upstream.
+
 Treat exported internals as omp-vim-local unless documented otherwise.
 Shipped source is `index.ts` plus the sibling `*.ts` lib modules; `tsconfig.json` scopes `typecheck` to those. The inherited `test/`, `script/`, and `doc/` trees still target the upstream `@earendil-works` API and the removed clipboard-subprocess design — they are NOT ported. CI (`.github/workflows/test.yml`) runs the shipped-source typecheck plus `test/omp-features.test.ts` (Bun) only; the legacy suite is excluded until it is ported.
 
