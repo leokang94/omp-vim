@@ -72,6 +72,12 @@ Targets/replacements: `( ) b`, `{ } B`, `[ ] r`, `< >`, `"`, `'`, `` ` ``. Openi
 - `ib`/`ab` auto-detect instead of meaning `()`; `i(`/`a(` still target parens only.
 - Function (`f`) and tag (`t`) recipes are not implemented.
 
+Pending feedback (both keymaps unless noted):
+
+- The mode label shows the keys typed so far: ` NORMAL saiw_ `, ` NORMAL sr'_ `, ` NORMAL ys_ `, ` NORMAL dis_ `, ` VISUAL s_ `.
+- While waiting for the last key, the target is highlighted: the `sa`/`ys`/visual `S` range is underlined; for `sr{old}`/`cs{old}`/visual `sr` the found pair is reverse-video and its contents underlined. No highlight after `sr{old}` means no pair was found (the next key is then swallowed as a no-op).
+- After `sa`/`sr` (sandwich only) the written pair flashes the same way for 250 ms or until the next key, like vim-sandwich's `highlight`. `sd`, `ds`, `cs`, `ys` do not flash.
+
 ### Redo
 
 `U` is a redo alias alongside `Ctrl-R`.

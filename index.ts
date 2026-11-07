@@ -173,13 +173,65 @@ type SurroundAddState =
       startAbs: number;
       endAbs: number;
     };
+type SurroundTarget = {
+  aStart: number;
+  aEnd: number;
+  iStart: number;
+  iEnd: number;
+};
 type SurroundState =
   | { op: "prefix" }
   | { op: "visualPrefix" }
-  | { op: "visualReplace"; startAbs: number; endAbs: number }
   | { op: "d"; style: SurroundStyle }
-  | { op: "c"; style: SurroundStyle; target: string | null }
+  | { op: "c"; style: SurroundStyle }
+  // Replacement pending for a resolved pair (`sr{old}`, `cs{old}`, visual
+  // `sr`). A null target still swallows the next key, then no-ops.
+  | { op: "cTo"; style: SurroundStyle; target: SurroundTarget | null }
   | SurroundAddState;
+
+type HighlightStyle = "reverse" | "underline";
+type HighlightSpan = { start: number; end: number; style: HighlightStyle };
+const HIGHLIGHT_SGR: Record<HighlightStyle, readonly [string, string]> = {
+  reverse: ["\x1b[7m", "\x1b[27m"],
+  underline: ["\x1b[4m", "\x1b[24m"],
+};
+/** How long `sa`/`sr` keep the written pair highlighted (vim-sandwich `highlight`). */
+export const SANDWICH_FLASH_MS = 250;
+
+function decorateHighlightSpans(
+  segment: string,
+  segmentStart: number,
+  spans: readonly HighlightSpan[],
+): string {
+  const segmentEnd = segmentStart + segment.length;
+  const local = spans.filter(
+    (s) => s.start < segmentEnd && s.end > segmentStart && s.end > s.start,
+  );
+  if (local.length === 0) return segment;
+
+  const cuts = new Set([0, segment.length]);
+  for (const s of local) {
+    cuts.add(Math.max(s.start, segmentStart) - segmentStart);
+    cuts.add(Math.min(s.end, segmentEnd) - segmentStart);
+  }
+  const points = [...cuts].sort((a, b) => a - b);
+  let out = "";
+  for (let i = 0; i < points.length - 1; i++) {
+    const from = points[i] ?? 0;
+    const to = points[i + 1] ?? from;
+    const piece = segment.slice(from, to);
+    let open = "";
+    let close = "";
+    for (const s of local) {
+      if (s.start > segmentStart + from || s.end < segmentStart + to) continue;
+      const [on, off] = HIGHLIGHT_SGR[s.style];
+      open += on;
+      close = off + close;
+    }
+    out += open + piece + close;
+  }
+  return out;
+}
 
 type ModeColorKey = keyof typeof MODE_COLORS;
 type ModeColorizers = Record<ModeColorKey, (s: string) => string>;
@@ -533,6 +585,13 @@ export class ModalEditor extends CustomEditor {
   private visualReplacePending: boolean = false;
   private surround: SurroundState | null = null;
   private surroundKeymap: SurroundKeymap = "sandwich";
+  // Keys typed since the current surround/sandwich command began (mode label).
+  private surroundKeys: string = "";
+  private flash: {
+    spans: HighlightSpan[];
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
+  private readonly requestRenderFn: () => void;
   private textWidth: number = 120;
   private formatOptions: string = "at";
   private effectiveTextWidth: number = 0;
@@ -571,6 +630,8 @@ export class ModalEditor extends CustomEditor {
   ) {
     super(theme);
     this.cursorShapeRuntime = getCursorShapeRuntime(tui);
+    const renderTarget = tui as { requestRender?: () => void } | undefined;
+    this.requestRenderFn = () => renderTarget?.requestRender?.();
     this.labelColorizers = opts?.labelColorizers ?? null;
     this.borderColorizers = opts?.borderColorizers ?? null;
     this.installModeBorderColorizer();
@@ -902,6 +963,7 @@ export class ModalEditor extends CustomEditor {
 
   handleInput(data: string): void {
     this.ensureOnChangeHook();
+    this.clearFlash();
 
     if (this.pendingExCommand !== null) {
       const normalized = this.normalizePendingExCommandInput(data);
@@ -1876,7 +1938,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "d", style: "surround" };
+      this.beginSurround({ op: "d", style: "surround" }, "ds");
       return;
     }
 
@@ -1958,7 +2020,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "c", style: "surround", target: null };
+      this.beginSurround({ op: "c", style: "surround" }, "cs");
       return;
     }
 
@@ -2070,7 +2132,7 @@ export class ModalEditor extends CustomEditor {
       // recommended `nmap s <Nop>`.
       this.prefixCount = "";
       this.operatorCount = "";
-      this.surround = { op: "prefix" };
+      this.beginSurround({ op: "prefix" }, "s");
       return;
     }
 
@@ -2517,13 +2579,16 @@ export class ModalEditor extends CustomEditor {
         ? this.visualLineAbsRange()
         : this.getVisualRange();
     this.exitVisualToNormal();
-    this.surround = {
-      op: "y",
-      style: "surround",
-      stage: "char",
-      startAbs: range.startAbs,
-      endAbs: range.endAbs,
-    };
+    this.beginSurround(
+      {
+        op: "y",
+        style: "surround",
+        stage: "char",
+        startAbs: range.startAbs,
+        endAbs: range.endAbs,
+      },
+      "S",
+    );
   }
 
   private handleVisualMode(data: string): void {
@@ -2560,7 +2625,7 @@ export class ModalEditor extends CustomEditor {
         return;
       case "s":
         if (this.surroundKeymap === "sandwich") {
-          this.surround = { op: "visualPrefix" };
+          this.beginSurround({ op: "visualPrefix" }, "s");
           return;
         }
         this.changeVisualSelection();
@@ -2641,7 +2706,7 @@ export class ModalEditor extends CustomEditor {
   private resolveSurroundTarget(
     target: string,
     style: SurroundStyle,
-  ): { aStart: number; aEnd: number; iStart: number; iEnd: number } | null {
+  ): SurroundTarget | null {
     const text = this.getText();
     const cursorAbs = this.getDelimitedTextObjectCursorAbs();
     if (style === "sandwich" && target === "b") {
@@ -2665,39 +2730,46 @@ export class ModalEditor extends CustomEditor {
     };
   }
 
-  private applySurroundDelete(target: string, style: SurroundStyle): void {
-    const r = this.resolveSurroundTarget(target, style);
+  /**
+   * Visual `sd`/`sr`: vim-sandwich treats the selection's own first and last
+   * characters as the pair, when they form one.
+   */
+  private resolveVisualSurroundTarget(
+    startAbs: number,
+    endAbs: number,
+  ): SurroundTarget | null {
+    if (endAbs - startAbs < 2) return null;
+    const text = this.getText();
+    const first = text[startAbs] ?? "";
+    const pair = this.surroundPair(first);
+    if (!pair || pair[0] !== first || pair[1] !== text[endAbs - 1]) return null;
+    return {
+      aStart: startAbs,
+      aEnd: endAbs,
+      iStart: startAbs + 1,
+      iEnd: endAbs - 1,
+    };
+  }
+
+  private deleteSurroundTarget(r: SurroundTarget | null): void {
     if (!r) return;
     const text = this.getText();
-    const inner = text.slice(r.iStart, r.iEnd);
     this.replaceTextInBuffer(
-      text.slice(0, r.aStart) + inner + text.slice(r.aEnd),
+      text.slice(0, r.aStart) +
+        text.slice(r.iStart, r.iEnd) +
+        text.slice(r.aEnd),
       r.aStart,
     );
   }
 
-  private applySurroundChange(
-    target: string,
+  private replaceSurroundTarget(
+    r: SurroundTarget | null,
     replacement: string,
     style: SurroundStyle,
   ): void {
-    const pair = this.surroundPair(replacement);
-    if (!pair) return;
-    const r = this.resolveSurroundTarget(target, style);
     if (!r) return;
-    const text = this.getText();
-    const inner = text.slice(r.iStart, r.iEnd);
-    const pad = this.surroundPadding(style, replacement);
-    this.replaceTextInBuffer(
-      text.slice(0, r.aStart) +
-        pair[0] +
-        pad +
-        inner +
-        pad +
-        pair[1] +
-        text.slice(r.aEnd),
-      r.aStart,
-    );
+    const inner = this.getText().slice(r.iStart, r.iEnd);
+    this.writeSurrounded(r.aStart, r.aEnd, inner, replacement, style, false);
   }
 
   private applySurroundAdd(
@@ -2706,49 +2778,84 @@ export class ModalEditor extends CustomEditor {
     char: string,
     style: SurroundStyle,
   ): void {
-    const pair = this.surroundPair(char);
-    if (!pair) return;
-    const text = this.getText();
-    const content = text.slice(startAbs, endAbs);
-    const pad = this.surroundPadding(style, char);
-    this.replaceTextInBuffer(
-      text.slice(0, startAbs) +
-        pair[0] +
-        pad +
-        content +
-        pad +
-        pair[1] +
-        text.slice(endAbs),
-      startAbs + pair[0].length + pad.length,
-    );
+    const content = this.getText().slice(startAbs, endAbs);
+    this.writeSurrounded(startAbs, endAbs, content, char, style, true);
   }
 
   /**
-   * Visual `sd` (replacement null) / `sr{new}`: vim-sandwich treats the
-   * selection's own first and last characters as the pair to remove/replace.
+   * Replaces [startAbs, endAbs) with `content` wrapped in the `char` pair.
+   * Sandwich style flashes the written pair, like vim-sandwich's highlight.
    */
-  private applyVisualSandwichEnds(
+  private writeSurrounded(
     startAbs: number,
     endAbs: number,
-    replacement: string | null,
+    content: string,
+    char: string,
+    style: SurroundStyle,
+    cursorAtContent: boolean,
   ): void {
+    const pair = this.surroundPair(char);
+    if (!pair) return;
+    const pad = this.surroundPadding(style, char);
+    const open = pair[0] + pad;
+    const close = pad + pair[1];
     const text = this.getText();
-    if (endAbs - startAbs < 2) return;
-    const first = text[startAbs] ?? "";
-    const existing = this.surroundPair(first);
-    if (!existing || existing[0] !== first || existing[1] !== text[endAbs - 1])
-      return;
-    const next =
-      replacement === null ? ["", ""] : this.surroundPair(replacement);
-    if (!next) return;
+    const contentStart = startAbs + open.length;
     this.replaceTextInBuffer(
-      text.slice(0, startAbs) +
-        next[0] +
-        text.slice(startAbs + 1, endAbs - 1) +
-        next[1] +
-        text.slice(endAbs),
-      startAbs,
+      text.slice(0, startAbs) + open + content + close + text.slice(endAbs),
+      cursorAtContent ? contentStart : startAbs,
     );
+    if (style !== "sandwich") return;
+    const contentEnd = contentStart + content.length;
+    this.startFlash(
+      this.surroundTargetSpans({
+        aStart: startAbs,
+        aEnd: contentEnd + close.length,
+        iStart: contentStart,
+        iEnd: contentEnd,
+      }),
+    );
+  }
+
+  /** Pair characters reversed, the enclosed range underlined. */
+  private surroundTargetSpans(r: SurroundTarget): HighlightSpan[] {
+    return [
+      { start: r.aStart, end: r.iStart, style: "reverse" },
+      { start: r.iStart, end: r.iEnd, style: "underline" },
+      { start: r.iEnd, end: r.aEnd, style: "reverse" },
+    ];
+  }
+
+  /** What a pending surround command will act on, shown until its last key. */
+  private getSurroundPendingSpans(): HighlightSpan[] {
+    const state = this.surround;
+    if (state?.op === "y" && state.stage === "char") {
+      return [{ start: state.startAbs, end: state.endAbs, style: "underline" }];
+    }
+    if (state?.op === "cTo" && state.target) {
+      return this.surroundTargetSpans(state.target);
+    }
+    return [];
+  }
+
+  private startFlash(spans: HighlightSpan[]): void {
+    this.clearFlash();
+    const timer = setTimeout(() => {
+      this.flash = null;
+      this.requestRenderFn();
+    }, SANDWICH_FLASH_MS);
+    this.flash = { spans, timer };
+  }
+
+  private clearFlash(): void {
+    if (!this.flash) return;
+    clearTimeout(this.flash.timer);
+    this.flash = null;
+  }
+
+  private beginSurround(state: SurroundState, keys: string): void {
+    this.surround = state;
+    this.surroundKeys = keys;
   }
 
   private resolveSurroundObjectRange(
@@ -2772,8 +2879,11 @@ export class ModalEditor extends CustomEditor {
   private handleSurroundInput(data: string): void {
     const state = this.surround;
     if (!state) return;
-    // Each handler re-arms `this.surround` only when it needs another key.
+    // Handlers re-arm `this.surround` (continuing the key trail) only when
+    // they need another key; re-dispatched commands start a fresh trail via
+    // beginSurround.
     this.surround = null;
+    this.surroundKeys += data;
 
     switch (state.op) {
       case "prefix":
@@ -2782,18 +2892,20 @@ export class ModalEditor extends CustomEditor {
       case "visualPrefix":
         this.handleVisualSandwichPrefix(data);
         return;
-      case "visualReplace":
-        this.applyVisualSandwichEnds(state.startAbs, state.endAbs, data);
-        return;
       case "d":
-        this.applySurroundDelete(data, state.style);
+        this.deleteSurroundTarget(
+          this.resolveSurroundTarget(data, state.style),
+        );
         return;
       case "c":
-        if (state.target === null) {
-          this.surround = { ...state, target: data };
-          return;
-        }
-        this.applySurroundChange(state.target, data, state.style);
+        this.surround = {
+          op: "cTo",
+          style: state.style,
+          target: this.resolveSurroundTarget(data, state.style),
+        };
+        return;
+      case "cTo":
+        this.replaceSurroundTarget(state.target, data, state.style);
         return;
       case "y":
         this.handleSurroundAddInput(state, data);
@@ -2814,7 +2926,7 @@ export class ModalEditor extends CustomEditor {
         this.surround = { op: "d", style: "sandwich" };
         return;
       case "r":
-        this.surround = { op: "c", style: "sandwich", target: null };
+        this.surround = { op: "c", style: "sandwich" };
         return;
       default:
         // `s` alone is a no-op prefix; the next key runs as a normal command.
@@ -2835,12 +2947,14 @@ export class ModalEditor extends CustomEditor {
     if (data === "a") {
       this.armSurroundAdd("sandwich", range);
     } else if (data === "d") {
-      this.applyVisualSandwichEnds(range.startAbs, range.endAbs, null);
+      this.deleteSurroundTarget(
+        this.resolveVisualSurroundTarget(range.startAbs, range.endAbs),
+      );
     } else {
       this.surround = {
-        op: "visualReplace",
-        startAbs: range.startAbs,
-        endAbs: range.endAbs,
+        op: "cTo",
+        style: "sandwich",
+        target: this.resolveVisualSurroundTarget(range.startAbs, range.endAbs),
       };
     }
   }
@@ -3808,7 +3922,7 @@ export class ModalEditor extends CustomEditor {
     if (this.opDigit(data)) return;
     if (data === "s") {
       this.pendingOperator = null;
-      this.surround = { op: "y", style: "surround", stage: "motion" };
+      this.beginSurround({ op: "y", style: "surround", stage: "motion" }, "ys");
       return;
     }
 
@@ -4267,11 +4381,8 @@ export class ModalEditor extends CustomEditor {
   }
 
   private renderContentLines(width: number): string[] {
-    const range =
-      this.mode === "visual" || this.mode === "visualLine"
-        ? this.getSelectionHighlightRange()
-        : null;
-    if (!range) return [...super.render(width)];
+    const spans = this.getHighlightSpans();
+    if (spans.length === 0) return [...super.render(width)];
 
     const text = this.getText();
     const cursorPos = this.getCursor();
@@ -4304,16 +4415,7 @@ export class ModalEditor extends CustomEditor {
         start = abs;
         abs += segment.length;
       }
-      const hs = Math.max(start, range.start) - start;
-      const he = Math.min(start + segment.length, range.end) - start;
-      if (he <= hs) return segment;
-      return (
-        segment.slice(0, hs) +
-        "\x1b[7m" +
-        segment.slice(hs, he) +
-        "\x1b[27m" +
-        segment.slice(he)
-      );
+      return decorateHighlightSpans(segment, start, spans);
     };
     // OMP 18 hands decorateText a column-info second argument that the
     // pinned @oh-my-pi type does not declare yet.
@@ -4325,7 +4427,20 @@ export class ModalEditor extends CustomEditor {
     }
   }
 
+  /**
+   * Visual selection (reverse), the range/pair a pending surround command
+   * targets, and the post-`sa`/`sr` flash.
+   */
+  private getHighlightSpans(): HighlightSpan[] {
+    const spans = [...this.getSurroundPendingSpans()];
+    if (this.flash) spans.push(...this.flash.spans);
+    const selection = this.getSelectionHighlightRange();
+    if (selection) spans.push({ ...selection, style: "reverse" });
+    return spans;
+  }
+
   private getSelectionHighlightRange(): { start: number; end: number } | null {
+    if (this.mode !== "visual" && this.mode !== "visualLine") return null;
     if (this.visualAnchor === null) return null;
     if (this.mode === "visualLine") {
       const r = this.visualLineAbsRange();
@@ -4341,8 +4456,21 @@ export class ModalEditor extends CustomEditor {
 
   private getModeLabel(): string {
     if ("insert" === this.mode) return " INSERT ";
-    if (this.mode === "visual") return " VISUAL ";
-    if (this.mode === "visualLine") return " V-LINE ";
+    const modeName =
+      this.mode === "visual"
+        ? "VISUAL"
+        : this.mode === "visualLine"
+          ? "V-LINE"
+          : "NORMAL";
+    if (this.surround !== null) return ` ${modeName} ${this.surroundKeys}_ `;
+    const textObjectKeys = this.pendingTextObjectQuery
+      ? `${this.pendingTextObjectQuery}s`
+      : (this.pendingTextObject ?? "");
+    if (this.mode === "visual" || this.mode === "visualLine") {
+      return textObjectKeys
+        ? ` ${modeName} ${textObjectKeys}_ `
+        : ` ${modeName} `;
+    }
     if (this.pendingExCommand !== null) return ` EX ${this.pendingExCommand}_ `;
 
     const prefixCount = this.prefixCount;
@@ -4355,7 +4483,7 @@ export class ModalEditor extends CustomEditor {
       return ` NORMAL ${prefixCount}${this.pendingOperator}${operatorCount}${this.pendingMotion}_ `;
     }
     if (this.pendingOperator) {
-      return ` NORMAL ${prefixCount}${this.pendingOperator}${operatorCount}_ `;
+      return ` NORMAL ${prefixCount}${this.pendingOperator}${operatorCount}${textObjectKeys}_ `;
     }
     if (this.pendingMotion) return ` NORMAL ${this.pendingMotion}_ `;
     if (this.pendingG) {

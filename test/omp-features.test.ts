@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getEditorTheme } from "@oh-my-pi/pi-coding-agent";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
-import { ModalEditor } from "../index.ts";
+import { ModalEditor, SANDWICH_FLASH_MS } from "../index.ts";
 import { readPiVimSurroundKeymap } from "../settings.ts";
 
 const ESC = "\x1b";
@@ -627,4 +627,94 @@ test("surroundKeymap setting: project overrides global, invalid ignored", () => 
     undefined,
   );
   assert.equal(readPiVimSurroundKeymap(undefined, undefined), undefined);
+});
+
+// --- sandwich pending feedback: label, target highlight, post-op flash ------
+
+const UNDERLINE_ON = "\x1b[4m";
+const label = (ed: ModalEditor) => ed.render(60).at(-1) ?? "";
+
+test("mode label shows the pending surround/sandwich key trail", () => {
+  const { ed, keys } = makeEditor();
+  ed.setText("hello world");
+  keys(`${ESC}0s`);
+  assert.match(label(ed), / NORMAL s_ /);
+  keys("aiw");
+  assert.match(label(ed), / NORMAL saiw_ /);
+  keys("'");
+  assert.match(label(ed), / NORMAL $/);
+
+  // `s` + non-sandwich key re-dispatches; a fresh `s` starts a new trail.
+  keys("ss");
+  assert.match(label(ed), / NORMAL s_ /);
+  keys(ESC);
+
+  keys("sr'");
+  assert.match(label(ed), / NORMAL sr'_ /);
+  keys(ESC);
+  keys("ys");
+  assert.match(label(ed), / NORMAL ys_ /);
+  keys(ESC);
+  keys("dis");
+  assert.match(label(ed), / NORMAL dis_ /);
+  keys(ESC);
+  keys("viws");
+  assert.match(label(ed), / VISUAL s_ /);
+});
+
+test("pending sa range is underlined until the pair char arrives", () => {
+  const { ed, keys } = makeEditor();
+  ed.setText("foo bar");
+  keys(`${ESC}$sa0`);
+  assert.ok(ed.render(60).join("").includes(`${UNDERLINE_ON}foo ba\x1b[24m`));
+});
+
+test("pending sr{old} highlights the found pair and its contents", () => {
+  const { ed, keys } = makeEditor();
+  ed.setText("say (hi there) ok");
+  keys(`${ESC}0fhsr(`);
+  const out = ed.render(60).join("");
+  assert.ok(
+    out.includes(`${UNDERLINE_ON}i there\x1b[24m\x1b[7m)\x1b[27m`),
+    out,
+  );
+  // No pair found: nothing highlighted, the next key is still swallowed.
+  const miss = makeEditor();
+  miss.ed.setText("no pair");
+  miss.keys(`${ESC}0sr(`);
+  assert.ok(!miss.ed.render(60).join("").includes(UNDERLINE_ON));
+  miss.keys("x");
+  assert.equal(miss.ed.getText(), "no pair");
+});
+
+test("sa/sr flash the written pair until the next key or the timeout", async () => {
+  let renders = 0;
+  const ed = new ModalEditor(
+    { requestRender: () => renders++ },
+    getEditorTheme(),
+    undefined,
+    {},
+  );
+  const keys = (s: string) => {
+    for (const c of s) ed.handleInput(c);
+  };
+  ed.setText("say (hi there) ok");
+  keys(`${ESC}0fhsr([`);
+  assert.equal(ed.getText(), "say [hi there] ok");
+  const flashed = ed.render(60).join("");
+  assert.ok(
+    flashed.includes(`${UNDERLINE_ON}hi there\x1b[24m\x1b[7m]\x1b[27m`),
+  );
+  keys("l");
+  assert.ok(!ed.render(60).join("").includes(UNDERLINE_ON));
+
+  keys("0saiw'");
+  assert.ok(ed.render(60).join("").includes(UNDERLINE_ON));
+  await new Promise((r) => setTimeout(r, SANDWICH_FLASH_MS + 100));
+  assert.ok(!ed.render(60).join("").includes(UNDERLINE_ON));
+  assert.equal(renders, 1);
+
+  // vim-surround commands do not flash.
+  keys("0wcs'\"");
+  assert.ok(!ed.render(60).join("").includes(UNDERLINE_ON));
 });
